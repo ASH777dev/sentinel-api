@@ -29,13 +29,20 @@ class SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self._script = self.redis.register_script(SLIDING_WINDOW_LUA)
 
-    async def check_limit(self, client_id: str) -> tuple[bool, int]:
+    async def check_limit(
+        self,
+        client_id: str,
+        max_requests: int | None = None,
+        window_seconds: int | None = None,
+    ) -> tuple[bool, int]:
+        limit = max_requests if max_requests is not None else self.max_requests
+        window = window_seconds if window_seconds is not None else self.window_seconds
         key = f"rl:{client_id}"
         now = time.time()
         member = f"{now}:{uuid.uuid4().hex[:8]}"
 
         allowed, remaining = await self._script(
             keys=[key],
-            args=[now, self.window_seconds, self.max_requests, member],
+            args=[now, window, limit, member],
         )
         return bool(allowed), int(remaining)
