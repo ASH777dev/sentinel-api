@@ -1,10 +1,10 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import time
 from typing import Literal
 
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     Request,
@@ -19,7 +19,13 @@ from sqlalchemy import case, desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.anomaly import AnomalyDetector
-from app.auth import TIER_CONFIG, generate_api_key, verify_api_key
+from app.auth import (
+    TIER_CONFIG,
+    AuthKeyContext,
+    cache_api_key,
+    generate_api_key,
+    verify_api_key,
+)
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine, get_db
 from app.models import APIKey, AnomalyAlert, RequestLog
@@ -30,6 +36,8 @@ redis_client: redis.Redis | None = None
 limiter: SlidingWindowRateLimiter | None = None
 detector: AnomalyDetector | None = None
 telemetry_manager = ConnectionManager()
+db_write_semaphore = asyncio.Semaphore(8)
+pending_tasks: set[asyncio.Task] = set()
 
 
 class CreateKeyRequest(BaseModel):
@@ -47,62 +55,74 @@ async def process_request_telemetry(
     allowed: bool,
     latency_ms: float,
 ) -> None:
-    rounded_latency = round(latency_ms, 2)
-    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        rounded_latency = round(latency_ms, 2)
+        now_iso = datetime.now(timezone.utc).isoformat()
 
-    triggered_alerts = await detector.evaluate(api_key_id=api_key_id, allowed=allowed)
-
-    async with AsyncSessionLocal() as session:
-        session.add(
-            RequestLog(
-                api_key_id=api_key_id,
-                client_ip=client_ip,
-                endpoint=endpoint,
-                status_code=status_code,
-                allowed=allowed,
-                latency_ms=rounded_latency,
-            )
+        triggered_alerts = await detector.evaluate(
+            api_key_id=api_key_id, allowed=allowed
         )
-        for alert in triggered_alerts:
-            session.add(
-                AnomalyAlert(
-                    api_key_id=api_key_id,
-                    client_ip=client_ip,
-                    alert_type=alert["alert_type"],
-                    severity=alert["severity"],
-                    details=alert["details"],
+
+        async with db_write_semaphore:
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    RequestLog(
+                        api_key_id=api_key_id,
+                        client_ip=client_ip,
+                        endpoint=endpoint,
+                        status_code=status_code,
+                        allowed=allowed,
+                        latency_ms=rounded_latency,
+                    )
                 )
-            )
-        await session.commit()
+                for alert in triggered_alerts:
+                    session.add(
+                        AnomalyAlert(
+                            api_key_id=api_key_id,
+                            client_ip=client_ip,
+                            alert_type=alert["alert_type"],
+                            severity=alert["severity"],
+                            details=alert["details"],
+                        )
+                    )
+                await session.commit()
 
-    await telemetry_manager.broadcast(
-        {
-            "type": "request",
-            "api_key_id": api_key_id,
-            "key_name": key_name,
-            "tier": tier,
-            "client_ip": client_ip,
-            "endpoint": endpoint,
-            "status_code": status_code,
-            "allowed": allowed,
-            "latency_ms": rounded_latency,
-            "timestamp": now_iso,
-        }
-    )
-
-    for alert in triggered_alerts:
         await telemetry_manager.broadcast(
             {
-                "type": "anomaly",
+                "type": "request",
                 "api_key_id": api_key_id,
                 "key_name": key_name,
+                "tier": tier,
                 "client_ip": client_ip,
-                "alert_type": alert["alert_type"],
-                "severity": alert["severity"],
-                "details": alert["details"],
+                "endpoint": endpoint,
+                "status_code": status_code,
+                "allowed": allowed,
+                "latency_ms": rounded_latency,
                 "timestamp": now_iso,
             }
         )
+
+        for alert in triggered_alerts:
+            await telemetry_manager.broadcast(
+                {
+                    "type": "anomaly",
+                    "api_key_id": api_key_id,
+                    "key_name": key_name,
+                    "client_ip": client_ip,
+                    "alert_type": alert["alert_type"],
+                    "severity": alert["severity"],
+                    "details": alert["details"],
+                    "timestamp": now_iso,
+                }
+            )
+    except Exception as exc:
+        print(f"[telemetry] background write failed: {exc}")
+
+
+def schedule_telemetry(*args) -> None:
+    task = asyncio.create_task(process_request_telemetry(*args))
+    pending_tasks.add(task)
+    task.add_done_callback(pending_tasks.discard)
 
 
 @asynccontextmanager
@@ -118,6 +138,7 @@ async def lifespan(app: FastAPI):
         socket_keepalive=True,
         retry_on_timeout=True,
     )
+    app.state.redis = redis_client
     limiter = SlidingWindowRateLimiter(
         redis_client=redis_client,
         max_requests=settings.rate_limit_max_requests,
@@ -125,11 +146,13 @@ async def lifespan(app: FastAPI):
     )
     detector = AnomalyDetector(redis_client=redis_client)
     yield
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
     await redis_client.aclose()
     await engine.dispose()
 
 
-app = FastAPI(title="Sentinel API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Sentinel API", version="0.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -169,6 +192,18 @@ async def create_api_key(payload: CreateKeyRequest, db: AsyncSession = Depends(g
     await db.commit()
     await db.refresh(new_key)
 
+    await cache_api_key(
+        redis_client,
+        key_hash,
+        AuthKeyContext(
+            id=new_key.id,
+            name=new_key.name,
+            tier=new_key.tier,
+            rate_limit=new_key.rate_limit,
+            window_seconds=new_key.window_seconds,
+        ),
+    )
+
     return {
         "id": new_key.id,
         "name": new_key.name,
@@ -184,8 +219,7 @@ async def create_api_key(payload: CreateKeyRequest, db: AsyncSession = Depends(g
 async def protected_resource(
     request: Request,
     response: Response,
-    background_tasks: BackgroundTasks,
-    api_key: APIKey = Depends(verify_api_key),
+    api_key: AuthKeyContext = Depends(verify_api_key),
 ):
     started = time.perf_counter()
     client_ip = request.client.host if request.client else "unknown"
@@ -201,8 +235,7 @@ async def protected_resource(
     response.headers["X-RateLimit-Remaining"] = str(remaining)
 
     status_code = 200 if allowed else 429
-    background_tasks.add_task(
-        process_request_telemetry,
+    schedule_telemetry(
         api_key.id,
         api_key.name,
         api_key.tier,
