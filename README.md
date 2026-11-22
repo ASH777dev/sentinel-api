@@ -1,0 +1,1 @@
+- **Live Telemetry Dashboard:** `https://YOUR-VERCEL-URL.vercel.app` ([Frontend Repo](https://github.com/ASH777dev/sentinel-dashboard))
